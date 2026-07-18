@@ -355,6 +355,3 @@ project/
 ## License
 
 This project is for educational and academic purposes only.
-## License
-
-This project is intended for educational and academic purposes only.
