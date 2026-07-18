@@ -1,0 +1,61 @@
+# 交叉编译器
+CC = aarch64-linux-gcc
+
+# 系统根目录
+SYSROOT := /opt/rk1808-sdk/buildroot/output/rockchip_rk1808/host/aarch64-buildroot-linux-gnu/sysroot
+
+# 目录定义
+SRC_DIR = src
+OBJ_DIR = obj
+BIN_DIR = bin
+INC_DIR = include
+LIB_DIR = lib
+# 目标程序
+TARGET = $(BIN_DIR)/main
+
+# 源文件与对象文件
+SRCS = $(wildcard $(SRC_DIR)/*.c) $(wildcard $(LIB_DRM_DIR)/*.c)
+OBJS = $(patsubst $(SRC_DIR)/%.c, $(OBJ_DIR)/%.o, $(filter $(SRC_DIR)/%.c, $(SRCS)))
+OBJS += $(patsubst $(LIB_DRM_DIR)/%.c, $(OBJ_DIR)/%.o, $(filter $(LIB_DRM_DIR)/%.c, $(SRCS)))
+
+# 编译选项（仅用于编译阶段）
+CPPFLAGS += --sysroot=$(SYSROOT)
+CPPFLAGS += -I $(SYSROOT)/usr/include/drm/
+CPPFLAGS += -I $(INC_DIR)
+CPPFLAGS += -Wall -g
+
+# 链接选项（仅用于链接阶段）
+LDFLAGS += -L$(LIB_DIR) -L$(SYSROOT)/usr/lib/
+LDFLAGS += -lDRMwrap -ldrm -ljpeg -lpthread -lcamera_capture_yuyv
+
+# 目标规则
+$(TARGET): $(OBJS) | $(BIN_DIR)
+	$(CC) -o $@ $^ $(LDFLAGS) $(CPPFLAGS)
+
+# 编译 C 源文件为 .o
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OBJ_DIR)
+	$(CC) $(CPPFLAGS) $(LDFLAGS) -c $< -o $@
+
+# 编译 DRMwrap 相关 C 文件
+$(OBJ_DIR)/%.o: $(LIB_DRM_DIR)/%.c | $(OBJ_DIR)
+	$(CC) $(CPPFLAGS) $(LDFLAGS) -c $< -o $@
+
+# 创建必要的目录
+$(OBJ_DIR):
+	mkdir -p $(OBJ_DIR)
+
+$(BIN_DIR):
+	mkdir -p $(BIN_DIR)
+
+# 编译 DRMwrap 共享库
+$(LIB_DIR)/libDRMwrap.so:
+	$(MAKE) -C $(LIB_DRM_DIR)
+
+# 清理
+.PHONY: clean distclean
+clean:
+	rm -rf $(OBJ_DIR) $(TARGET)
+
+distclean: clean
+	$(MAKE) -C $(LIB_DRM_DIR) clean
+

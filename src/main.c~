@@ -1,0 +1,572 @@
+#include <stdio.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <linux/input.h>
+#include "camera_capture_yuyv.h"
+#include "jpeglib.h"
+#include <setjmp.h>
+#include <string.h>
+#include <pthread.h>
+
+// 抓拍标记
+int capture_flag = 0;
+// 摄像头（打开，关闭）
+int camera_flag = 0;
+int lcd_fd = -1;
+int camera_fd = -1, ts_fd = -1;
+int *lcd_ptr = NULL;
+struct buffer jpeg_buf;
+unsigned char lcd_buf[1024 * 600 * 4] = {0};
+
+// 1. 准备背景图：三张，主界面，相册，摄像头，1024 600 24
+
+// 2. 准备图标：200，200
+// 主界面：相册图标，摄像头图标，
+// 相册：上一张图标，下一张图标
+// 摄像头：打开，抓拍，关闭
+
+// 3. 代码修正：图片名字变化，图片显示位置，实现显示
+
+// 4. 触摸屏点击的位置判断要修正，要根据实际图标显示的位置来确定
+
+// 5. 编译：make
+
+// 6. 上传素材和程序：图片，bmp
+
+// 7. 赋予权限
+
+// 8. 运行程序
+
+// 定义触摸点结构体
+typedef struct
+{
+    int x;        // X坐标
+    int y;        // Y坐标
+    int pressure; // 触摸压力
+    bool valid;   // 有效标志位
+} TouchPoint;
+
+// 获取一个完整触摸点
+TouchPoint get_touch_data(int fd)
+{
+    struct input_event ev;
+    static TouchPoint point = {0};
+
+    point.valid = false;
+
+    while (read(fd, &ev, sizeof(ev)) == sizeof(ev))
+    {
+        switch (ev.type)
+        {
+        case EV_ABS:
+            switch (ev.code)
+            {
+            // 蓝色
+            case ABS_X:
+                point.x = ev.value;
+                break;
+            case ABS_Y:
+                point.y = ev.value;
+                break;
+            // 黑色
+            // case ABS_X: point.x = ev.value*800/1024; break;
+            // case ABS_Y: point.y = ev.value*480/600; break;
+            case ABS_PRESSURE:
+                point.pressure = ev.value;
+                break;
+            }
+            break;
+
+        case EV_KEY:
+            if (ev.code == BTN_TOUCH && ev.value == 0)
+            {
+                // 触摸抬起时，标记数据有效
+                point.valid = true;
+                return point;
+            }
+            break;
+        }
+    }
+
+    return (TouchPoint){0}; // 错误或中断返回
+}
+
+// 画点
+int lcd_draw_point(int i, int j, int color)
+{
+    *(lcd_ptr + 1024 * j + i) = color;
+
+    return 0;
+}
+
+struct my_error_mgr
+{
+    struct jpeg_error_mgr pub; /* "public" fields */
+
+    jmp_buf setjmp_buffer; /* for return to caller */
+};
+
+typedef struct my_error_mgr *my_error_ptr;
+
+/*
+ * Here's the routine that will replace the standard error_exit method:
+ */
+
+METHODDEF(void)
+my_error_exit(j_common_ptr cinfo)
+{
+    /* cinfo->err really points to a my_error_mgr struct, so coerce pointer */
+    my_error_ptr myerr = (my_error_ptr)cinfo->err;
+
+    /* Always display the message. */
+    /* We could postpone this until after returning, if we chose. */
+    (*cinfo->err->output_message)(cinfo);
+
+    /* Return control to the setjmp point */
+    longjmp(myerr->setjmp_buffer, 1);
+}
+
+// 指定静态/动态图像数据显示
+// int x, int y
+// const char *pathname :指定静态数据源
+// char *jpeg_buf : 动态数据源
+// int jpeg_size : 动态数据的大小
+// int zoom_flag : 缩放比列
+int lcd_draw_jpeg(int x, int y, const char *pathname, unsigned char *jpeg_buf, int jpeg_size, int zoom_flag)
+{
+    int img_fd;
+    unsigned char *img_buf;
+    int img_size;
+    unsigned char *argb_buf = lcd_buf;
+    int x_c = x;
+
+    // jpeg解压缩对象和错误处理对象
+    struct jpeg_decompress_struct cinfo;
+    struct my_error_mgr jerr;
+    struct stat statbuf;
+
+    if (pathname != NULL)
+    {
+        // 打开图片文件
+        img_fd = open(pathname, O_RDWR);
+
+        if (img_fd == -1)
+        {
+            printf("open jpeg file [ %s ] failed !\n", pathname);
+            return -1;
+        }
+
+        // 获取文件大小
+        fstat(img_fd, &statbuf);
+
+        img_size = statbuf.st_size;
+
+        img_buf = calloc(1, img_size);
+
+        read(img_fd, img_buf, img_size);
+    }
+    else
+    {
+        img_size = jpeg_size;
+        img_buf = jpeg_buf;
+    }
+
+    /* Step 1: 分配并初始化jpeg解压缩对象 */
+
+    // 错误处理
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = my_error_exit;
+
+    if (setjmp(jerr.setjmp_buffer))
+    {
+        // 释放资源
+        jpeg_destroy_decompress(&cinfo);
+        if (pathname != NULL)
+        {
+            close(img_fd);
+        }
+        return -1;
+    }
+
+    // 初始化解压缩对象
+    jpeg_create_decompress(&cinfo);
+
+    /* Step 2: 指定解压缩数据源 (eg, a file) */
+
+    jpeg_mem_src(&cinfo, img_buf, img_size);
+
+    /* Step 3: 读取图片文件的详细信息 */
+    (void)jpeg_read_header(&cinfo, TRUE);
+
+    /* Step 4: 解压缩的参数设置，一般默认 */
+    cinfo.scale_num = 1;           // 分子
+    cinfo.scale_denom = zoom_flag; // 分母
+
+    /* Step 5: 开始解压 */
+    (void)jpeg_start_decompress(&cinfo);
+
+    int i, r, g, b, color;
+
+    /* Step 6: 取出数据 */
+    // cinfo.output_scanline：当前行号
+    // cinfo.output_height：对应的图片的高
+    // cinfo.output_width：对应的图片的宽
+    while (cinfo.output_scanline < cinfo.output_height)
+    {
+        argb_buf = lcd_buf;
+        // 每次读取一行的数据
+        (void)jpeg_read_scanlines(&cinfo, (JSAMPARRAY)&argb_buf, 1);
+
+        for (i = 0; i < cinfo.output_width; i++)
+        {
+            b = *(argb_buf + 2);
+            g = *(argb_buf + 1);
+            r = *(argb_buf + 0);
+
+            // 合并
+            color = b;
+            color |= (g << 8);
+            color |= (r << 16);
+
+            lcd_draw_point(x, y, color);
+
+            argb_buf += 3;
+            x++;
+        }
+        y++;
+        x = x_c;
+    }
+
+    /* Step 7: 解压完毕 */
+    (void)jpeg_finish_decompress(&cinfo);
+
+    /* Step 8: 释放资源 */
+    jpeg_destroy_decompress(&cinfo);
+
+    if (pathname != NULL)
+    {
+        close(img_fd);
+    }
+
+    return 0;
+}
+
+// 实时监控函数
+void *read_camera_data(void *arg)
+{
+    pthread_detach(pthread_self());
+    char pic_name[20];
+
+    static int jpg_num = 0;
+    capture_flag = 0;
+    camera_flag = 0;
+
+    while (1)
+    {
+        if (camera_flag == 1)
+        {
+            // 3，获取摄像头捕捉的画面
+            camera_capture_get_frame(&jpeg_buf);
+
+            // 4, yuyv格式转换jpeg
+            yuyv2jpeg(jpeg_buf.start, jpeg_buf.length, 99);
+
+            // 5，显示摄像头捕捉的画面
+            lcd_draw_jpeg(0, 0, NULL, jpeg_buf.start, jpeg_buf.length, 1);
+
+            // 5，如果点击抓拍，保存图片信息
+            if (capture_flag == 1)
+            {
+
+                // 创建一个新的文件
+                bzero(pic_name, 20);
+
+                sprintf(pic_name, "%d.jpg", jpg_num++);
+
+                int pic_fd = open(pic_name, O_RDWR | O_CREAT, 0777);
+
+                if (-1 == pic_fd)
+                {
+                    perror("create jpg failed");
+                    continue;
+                }
+
+                write(pic_fd, jpeg_buf.start, jpeg_buf.length);
+                // 显示缩略图，调整起始位置（第一个参数，第二个参数，最后一个参数缩放比例：640，480，）
+                lcd_draw_jpeg(0, 0, NULL, jpeg_buf.start, jpeg_buf.length, 4);
+
+                close(pic_fd);
+
+                capture_flag = 0;
+            }
+        }
+        // 6，退出
+        if (camera_flag == 3)
+        {
+            break;
+        }
+    }
+
+    pthread_exit(NULL);
+}
+
+// 显示图片：
+// 显示的起点
+// 图片的宽度高度
+// 图片名字
+int lcd_draw_bmp(const char *pathname, int x, int y, int w, int h)
+{
+    // 1. 打开图片文件
+
+    int bmp_fd = open(pathname, O_RDONLY);
+
+    if (bmp_fd == -1)
+    {
+        perror("open bmp failed");
+        return -1;
+    }
+
+    // 2. 读取图片文件头，跳过54字节
+
+    char header[54];
+    char rgb_buf[w * h * 3];
+
+    read(bmp_fd, header, 54);
+    read(bmp_fd, rgb_buf, w * h * 3);
+
+    // 3. 解析图片数据，转换为32位数据
+
+    int i, j;
+    int r, g, b;
+    int color;
+
+    for (j = 0; j < h; j++)
+    {
+        for (i = 0; i < w; i++)
+        {
+            b = rgb_buf[(j * w + i) * 3];
+            g = rgb_buf[(j * w + i) * 3 + 1];
+            r = rgb_buf[(j * w + i) * 3 + 2];
+            color = (r << 16) | (g << 8) | b;
+            lcd_ptr[(h - 1 - j + y) * 1024 + i + x] = color;
+        }
+    }
+
+    // 4. 关闭图片文件
+    close(bmp_fd);
+
+    return 0;
+}
+
+int dev_init(void)
+{
+    lcd_fd = open("/dev/fb0", O_RDWR);
+    if (lcd_fd == -1)
+    {
+        perror("open /dev/fb0 failed");
+        return -1;
+    }
+    // 内存映射
+    lcd_ptr = mmap(NULL, 1024 * 600 * 4, PROT_READ | PROT_WRITE, MAP_SHARED, lcd_fd, 0);
+
+    if (lcd_ptr == MAP_FAILED)
+    {
+        perror("mmap failed");
+        close(lcd_fd);
+        return -1;
+    }
+
+    const char *device_path = "/dev/input/event0"; // 修改为实际设备路径
+    ts_fd = open(device_path, O_RDONLY);
+    if (ts_fd == -1)
+    {
+        perror("Failed to open touch device");
+        return 1;
+    }
+
+    // 1，设备初始化
+    camera_capture_open("/dev/video7");
+
+    camera_capture_init(&jpeg_buf);
+
+    // 2，开启捕捉
+    camera_capture_start_capturing();
+
+    // 设备初始化代码
+    printf("Device initialized.\n");
+    return 0;
+}
+
+void dev_uninit(void)
+{
+    camera_capture_stop_capturing();
+    camera_capture_uninit(&jpeg_buf);
+    camera_capture_close();
+    // 取消内存映射
+    munmap(lcd_ptr, 1024 * 600 * 4);
+    // 关闭设备文件
+    close(lcd_fd);
+    close(ts_fd);
+    printf("Device uninitialized.\n");
+}
+
+int main_interface()
+{
+    // a. 主界面
+    // const char *pathname = "main.bmp";
+    // int w = 800;
+    // int h = 480;
+    lcd_draw_bmp("main.bmp", 0, 0, 800, 480);
+    // 主界面：相册图标
+    lcd_draw_bmp("icon_album.bmp", 100, 280, 200, 200);
+    // 主界面：摄像头图标
+    lcd_draw_bmp("icon_camera.bmp", 500, 280, 200, 200);
+}
+
+void ablum_interface()
+{
+    // b. 相册界面
+    lcd_draw_bmp("album.bmp", 0, 0, 800, 480);
+    // 相册界面：上一张
+    lcd_draw_bmp("prev.bmp", 100, 100, 200, 200);
+    // 相册界面：下一张
+    lcd_draw_bmp("next.bmp", 600, 100, 200, 200);
+    // 关闭
+    lcd_draw_bmp("close.bmp", 600, 300, 100, 100);
+}
+
+void camera_interface()
+{
+    // c. 摄像头界面
+    lcd_draw_bmp("camera.bmp", 0, 0, 800, 480);
+    // 摄像头界面：打开
+    lcd_draw_bmp("open.bmp", 600, 50, 100, 100);
+    // 摄像头界面：抓拍
+    lcd_draw_bmp("capture.bmp", 600, 175, 100, 100);
+    // 摄像头界面：关闭
+    lcd_draw_bmp("close.bmp", 600, 300, 100, 100);
+}
+
+int main(void)
+{
+    // 1. 设备的初始化
+    dev_init();
+
+    while (1)
+    {
+        // 2. 界面布局，通过 lcd_draw_bmp 函数调用实现不同界面切换
+        main_interface();
+        TouchPoint point = get_touch_data(ts_fd);
+
+        if (point.valid)
+        {
+            printf("main Touch Point: X=%d, Y=%d, Pressure=%d\n",
+                   point.x, point.y, point.pressure);
+
+            if (point.pressure == 0)
+            {
+                printf("Touch released\n");
+            }
+
+            // 相册图标：100, 280, 200, 200)
+            if (point.x >= 100 && point.x < 300 && point.y >= 280 && point.y < 480)
+            {
+                const char *pathnames[] = {
+                    "0.jpg",
+                    "1.jpg",
+                    "2.jpg",
+                    "3.jpg",
+                    "4.jpg"};
+                int count = 0;
+                ablum_interface();
+                while (1)
+                {
+                    TouchPoint point = get_touch_data(ts_fd);
+
+                    if (point.valid)
+                    {
+                        printf("ablum Touch Point: X=%d, Y=%d, Pressure=%d\n",
+                               point.x, point.y, point.pressure);
+
+                        if (point.pressure == 0)
+                        {
+                            printf("Touch released\n");
+                        }
+
+                        // 上一张图标：100, 280, 200, 200)
+                        if (point.x >= 100 && point.x < 300 && point.y >= 280 && point.y < 480)
+                        {
+                            count--;
+                            if (count == -1)
+                            {
+                                count = 4;
+                            }
+                            lcd_draw_jpeg(0, 0, pathnames[count], NULL, 0, 1);
+                        }
+                        // 下一张图标：100, 280, 200, 200)
+                        if (point.x >= 100 && point.x < 300 && point.y >= 280 && point.y < 480)
+                        {
+                            lcd_draw_jpeg(0, 0, pathnames[count], NULL, 0, 1);
+                        }
+                        // 退出图标：100, 280, 200, 200)
+                        if (point.x >= 600 && point.x < 700 && point.y >= 380 && point.y < 480)
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+            // 摄像头图标
+            if (point.x >= 100 && point.x < 300 && point.y >= 280 && point.y < 480)
+            {
+                camera_interface();
+                // 创建一条线程实时监控
+                pthread_t camera_tid;
+                pthread_create(&camera_tid, NULL, read_camera_data, NULL);
+                while (1)
+                {
+                    TouchPoint point = get_touch_data(ts_fd);
+
+                    if (point.valid)
+                    {
+                        printf("camera Touch Point: X=%d, Y=%d, Pressure=%d\n",
+                               point.x, point.y, point.pressure);
+
+                        if (point.pressure == 0)
+                        {
+                            printf("Touch released\n");
+                        }
+
+                        // 打开图标：100, 280, 200, 200)
+                        if (point.x >= 100 && point.x < 300 && point.y >= 280 && point.y < 480)
+                        {
+                            camera_flag = 1;
+                        }
+                        // 抓拍图标：100, 280, 200, 200)
+                        if (point.x >= 100 && point.x < 300 && point.y >= 280 && point.y < 480)
+                        {
+                            capture_flag = 1;
+                        }
+                        // 退出图标：100, 280, 200, 200)
+                        if (point.x >= 100 && point.x < 300 && point.y >= 280 && point.y < 480)
+                        {
+                            // camera_flag = ?;
+                            sleep(1);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. 设备卸载
+    dev_uninit();
+
+    return 0;
+}
